@@ -32,6 +32,7 @@ import (
 
 const (
 	MULTUS_NET_ANNOTATION = "k8s.v1.cni.cncf.io/networks"
+	MAX_RETRIES           = 2
 )
 
 type WhereaboutsController struct {
@@ -118,7 +119,8 @@ func (wc *WhereaboutsController) Run(stopCh <-chan struct{}) error {
 	}
 
 	zap.S().Infof("Starting workers")
-	go wait.Until(wc.runWorker, time.Second, stopCh)
+	go wait.Until(wc.runAddPodWorker, time.Second, stopCh)
+	go wait.Until(wc.runDelPodWorker, time.Second, stopCh)
 
 	zap.S().Infof("Started workers")
 	<-stopCh
@@ -127,29 +129,85 @@ func (wc *WhereaboutsController) Run(stopCh <-chan struct{}) error {
 	return nil
 }
 
-func (wc *WhereaboutsController) runWorker() {
-	for wc.processNextWorkItem() {
+func (wc *WhereaboutsController) runAddPodWorker() {
+	for wc.processNextAddPod() {
 	}
 }
 
-func (wc *WhereaboutsController) processNextWorkItem() bool {
-	queueItem, shouldQuit := wc.workqueue.Get()
+func (wc *WhereaboutsController) processNextAddPod() bool {
+	queueItem, shouldQuit := wc.addQueue.Get()
 	if shouldQuit {
 		return false
 	}
 
-	podInfo := queueItem.(*PodInfo)
-	if podInfo.operand == "ADD" {
-		defer pc.delQueue.Done(queueItem)
-		err := wc.AllocateIpForPod(podInfo)
-		wc.handleResult(pod, err)
-	} else if podInfo.operand == "DEL" {
-		defer pc.delQueue.Done(queueItem)
-		err := wc.DeleteIpForPod(podInfo)
-		wc.handleResult(pod, err)
+	defer wc.addQueue.Done(queueItem)
+
+	podInfo, ok := queueItem.(*PodInfo)
+	if !ok {
+		wc.addQueue.Forget(queueItem)
+		zap.S().Errorf("Expected PodInfo in queue but got %+v", *podInfo)
+		return true
 	}
 
+	err := wc.AllocateIpForPod(podInfo)
+	wc.handleResultAndRequeue(podInfo, wc.addQueue, err)
+
 	return true
+}
+
+func (wc *WhereaboutsController) runDelPodWorker() {
+	for wc.processNextDelPod() {
+	}
+}
+
+func (wc *WhereaboutsController) processNextDelPod() bool {
+	queueItem, shouldQuit := wc.delQueue.Get()
+	if shouldQuit {
+		return false
+	}
+
+	defer wc.delQueue.Done(queueItem)
+
+	podInfo, ok := queueItem.(*PodInfo)
+	if !ok {
+		wc.addQueue.Forget(queueItem)
+		zap.S().Errorf("Expected PodInfo in queue but got %+v", *podInfo)
+		return true
+	}
+
+	err := wc.DeleteIpForPod(podInfo)
+	wc.handleResultAndRequeue(podInfo, wc.delQueue, err)
+
+	return true
+}
+
+func (wc *WhereaboutsController) handleResultAndRequeue(podInfo *PodInfo, queue workqueue.RateLimitingInterface, err error) {
+	if err == nil {
+		queue.Forget(podInfo)
+		return
+	}
+
+	currentRetries := queue.NumRequeues(podInfo)
+	if currentRetries <= MAX_RETRIES {
+		zap.S().Warnf(
+			"re-queuing request for pod %+v; retry #: %d",
+			*podInfo,
+			currentRetries)
+		queue.AddRateLimited(podInfo)
+		return
+	}
+
+	queue.Forget(podInfo)
+}
+
+func (wc *WhereaboutsController) AllocateIpForPod(podInfo *PodInfo) error {
+	fmt.Printf("Allocated IP for pod %s", podInfo.podRef)
+	return nil
+}
+
+func (wc *WhereaboutsController) DeleteIpForPod(podInfo *PodInfo) error {
+	fmt.Printf("Allocated IP for pod %s", podInfo.podRef)
+	return nil
 }
 
 func (wc *WhereaboutsController) eventAddPod(obj interface{}) {
@@ -161,7 +219,7 @@ func (wc *WhereaboutsController) eventAddPod(obj interface{}) {
 	zap.S().Infof("Got new pod %s\n", pod.ObjectMeta.Name)
 	networks, isMultus := GetPodMultusNetworks(pod)
 	if !isMultus {
-		zap.S().Infof("Pod %s has no multus network annotations, skipping", pod.Name())
+		zap.S().Infof("Pod %s has no multus network annotations, skipping", pod.GetName())
 		return
 	}
 	zap.S().Infof("Has annotations %v", networks)
